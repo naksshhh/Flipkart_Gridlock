@@ -229,11 +229,8 @@ def add_slot_global(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
     """
     slot_mean = train_src.groupby("slot")["demand"].mean()
     glb = train_src["demand"].mean()
-    rt_slot = train_src.groupby(["RoadType_enc", "slot"])["demand"].mean()
     for df in dfs:
         df["slot_global_mean"] = df["slot"].map(slot_mean).fillna(glb)
-        key = pd.MultiIndex.from_arrays([df["RoadType_enc"], df["slot"]])
-        df["rt_slot_mean"] = pd.Series(rt_slot.reindex(key).values, index=df.index).fillna(df["slot_global_mean"])
 
 
 def add_d49_d48_calibration(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
@@ -413,7 +410,6 @@ def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_su
         "d48_p90",
         "d48_std",
         "slot_global_mean",
-        "rt_slot_mean",
         "d49_last_demand",
         "d49_mean",
         "d49_slot_gap",
@@ -532,25 +528,64 @@ def main(args):
         print(imp.head(20).to_string(index=False))
         return
 
-    # Full submission run with random 10% hold-out for early stopping
+    # Full submission run: multi-seed LightGBM ensemble with day-49 hold-out
+    # for per-seed early stopping. Predictions averaged on the original scale.
     tr_df, te_df, feats = build_features(tr_raw, te_raw)
-    rng = np.random.default_rng(42)
-    n = len(tr_df)
-    perm = rng.permutation(n)
-    cut = int(n * 0.1)
-    val_idx = perm[:cut]
-    fit_idx = perm[cut:]
+
+    # Validation slice: 20% of day-49 train rows (same distribution as test)
+    rng_split = np.random.default_rng(42)
+    d49_pos = np.where(tr_df["day"].to_numpy() == 49)[0]
+    rng_split.shuffle(d49_pos)
+    n_val = int(len(d49_pos) * 0.2)
+    val_pos = d49_pos[:n_val]
+    fit_pos = np.setdiff1d(np.arange(len(tr_df)), val_pos)
 
     X = tr_df[feats]
     y = tr_df["demand"]
     X_te = te_df[feats]
+    X_val = X.iloc[val_pos]
+    y_val = y.iloc[val_pos]
 
-    model = train_lgbm(X.iloc[fit_idx], y.iloc[fit_idx], X.iloc[val_idx], y.iloc[val_idx])
-    preds_val = np.clip(model.predict(X.iloc[val_idx], num_iteration=model.best_iteration), 0, 1)
-    print(f"\nRandom-hold-out R^2 = {r2_score(y.iloc[val_idx], preds_val):.5f}")
+    use_log = not args.no_log_target
+    if use_log:
+        print("Using log1p target transform")
+        y_fit_full = np.log1p(y)
+        y_val_used = np.log1p(y_val)
+    else:
+        y_fit_full = y
+        y_val_used = y_val
 
-    preds = np.clip(model.predict(X_te, num_iteration=model.best_iteration), 0, 1)
-    sub = pd.DataFrame({"Index": te_raw["Index"], "demand": preds})
+    n_seeds = args.seeds
+    test_preds = np.zeros(len(te_df))
+    val_preds = np.zeros(len(val_pos))
+    seed_r2s = []
+    seed_imps = []
+
+    for s in range(n_seeds):
+        seed = 42 + s * 7
+        print(f"\n=== Seed {s+1}/{n_seeds} (seed={seed}) ===")
+        params = {"seed": seed, "feature_fraction_seed": seed, "bagging_seed": seed}
+        model = train_lgbm(X.iloc[fit_pos], y_fit_full.iloc[fit_pos], X_val, y_val_used, params=params)
+
+        vp = model.predict(X_val, num_iteration=model.best_iteration)
+        tp = model.predict(X_te, num_iteration=model.best_iteration)
+        if use_log:
+            vp = np.expm1(vp)
+            tp = np.expm1(tp)
+        vp = np.clip(vp, 0, 1)
+        tp = np.clip(tp, 0, 1)
+        val_preds += vp / n_seeds
+        test_preds += tp / n_seeds
+
+        r2 = r2_score(y_val, vp)
+        seed_r2s.append(r2)
+        print(f"   seed {seed} val R^2 = {r2:.5f}")
+        seed_imps.append(model.feature_importance("gain"))
+
+    ens_r2 = r2_score(y_val, val_preds)
+    print(f"\n>>> Ensemble val R^2 = {ens_r2:.5f}   (mean per-seed = {np.mean(seed_r2s):.5f})")
+
+    sub = pd.DataFrame({"Index": te_raw["Index"], "demand": test_preds})
     out_path = OUT / args.out
     sub.to_csv(out_path, index=False)
     print(f"\nSaved submission: {out_path}  (rows={len(sub)})")
@@ -558,9 +593,10 @@ def main(args):
     print("\nPrediction summary:")
     print(sub["demand"].describe())
 
-    imp = pd.DataFrame({"feature": feats, "gain": model.feature_importance("gain")}).sort_values("gain", ascending=False)
-    print("\nTop features by gain:")
-    print(imp.head(25).to_string(index=False))
+    avg_imp = np.mean(seed_imps, axis=0)
+    imp = pd.DataFrame({"feature": feats, "gain": avg_imp}).sort_values("gain", ascending=False)
+    print("\nTop features by gain (avg over seeds):")
+    print(imp.head(20).to_string(index=False))
 
 
 if __name__ == "__main__":
@@ -569,5 +605,7 @@ if __name__ == "__main__":
     ap.add_argument("--day49_only", action="store_true", help="Train on day-49 rows only (matches test distribution)")
     ap.add_argument("--hard_val", action="store_true", help="Use day-49 slots 5-8 as validation (closer to test slot-gap)")
     ap.add_argument("--log_target", action="store_true", help="Train on log1p(demand)")
+    ap.add_argument("--no_log_target", action="store_true", help="Disable log target in submission mode")
+    ap.add_argument("--seeds", type=int, default=5, help="Number of seeds for ensemble in submission mode")
     ap.add_argument("--out", default="submission_v2.csv")
     main(ap.parse_args())
