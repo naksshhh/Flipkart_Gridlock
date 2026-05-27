@@ -223,11 +223,17 @@ def add_day48_stats(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
 
 
 def add_slot_global(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
-    """Cross-geohash mean demand per slot — captures the daily rush-hour curve."""
+    """Cross-geohash mean demand per slot — captures the daily rush-hour curve.
+
+    Also adds per-(RoadType, slot) mean: highway-vs-residential rush patterns.
+    """
     slot_mean = train_src.groupby("slot")["demand"].mean()
     glb = train_src["demand"].mean()
+    rt_slot = train_src.groupby(["RoadType_enc", "slot"])["demand"].mean()
     for df in dfs:
         df["slot_global_mean"] = df["slot"].map(slot_mean).fillna(glb)
+        key = pd.MultiIndex.from_arrays([df["RoadType_enc"], df["slot"]])
+        df["rt_slot_mean"] = pd.Series(rt_slot.reindex(key).values, index=df.index).fillna(df["slot_global_mean"])
 
 
 def add_d49_d48_calibration(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
@@ -359,6 +365,7 @@ def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_su
     if train_src_subset is not None:
         src = train_src_subset.copy()
         parse_time(src)
+        encode_categoricals(src)
     else:
         src = train
     add_geohash_aggregates(src, [train, test])
@@ -406,6 +413,7 @@ def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_su
         "d48_p90",
         "d48_std",
         "slot_global_mean",
+        "rt_slot_mean",
         "d49_last_demand",
         "d49_mean",
         "d49_slot_gap",
