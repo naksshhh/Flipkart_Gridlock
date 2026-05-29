@@ -65,6 +65,7 @@ def parse_time(df: pd.DataFrame) -> pd.DataFrame:
     df["hour"] = parts[0].astype(int)
     df["minute"] = parts[1].astype(int)
     df["slot"] = df["hour"] * 4 + df["minute"] // 15
+    df["slot_block"] = df["slot"] // 8  # 12 blocks of 2 hours
     # cyclical
     df["slot_sin"] = np.sin(2 * np.pi * df["slot"] / 96)
     df["slot_cos"] = np.cos(2 * np.pi * df["slot"] / 96)
@@ -128,6 +129,124 @@ def impute_static_by_geohash(train: pd.DataFrame, test: pd.DataFrame) -> tuple[p
 
 
 # ---------- target-encoded / lag features ----------
+def add_geohash_aggregates_oof(train_src: pd.DataFrame, train_df: pd.DataFrame, test_df: pd.DataFrame, n_folds: int = 5) -> None:
+    """K-fold OOF target encoding for per-geohash aggregates on training rows.
+
+    Training rows: for each fold, compute aggregates from the other K-1 folds
+    of train_src and apply to the held-out fold of train_df.
+    Test rows: use the full train_src to compute aggregates.
+
+    This eliminates the row's own target from its own per-geohash mean.
+    """
+    rng = np.random.default_rng(0)
+    n = len(train_src)
+    fold_ids = rng.integers(0, n_folds, size=n)
+    global_mean = train_src["demand"].mean()
+
+    # Test gets full-train aggregates
+    g_full = train_src.groupby("geohash")["demand"]
+    test_df["geo_mean"] = test_df["geohash"].map(g_full.mean()).fillna(global_mean)
+    test_df["geo_median"] = test_df["geohash"].map(g_full.median()).fillna(global_mean)
+    test_df["geo_std"] = test_df["geohash"].map(g_full.std()).fillna(0.0)
+    test_df["geo_max"] = test_df["geohash"].map(g_full.max()).fillna(global_mean)
+
+    # For train_df rows, only OOF if train_df == train_src (same set). Otherwise
+    # treat train_df as "another" frame and use full aggregates (no leakage anyway).
+    same_rows = (len(train_df) == n)
+    if same_rows:
+        geo_mean = np.full(n, np.nan)
+        geo_median = np.full(n, np.nan)
+        geo_std = np.full(n, np.nan)
+        geo_max = np.full(n, np.nan)
+        for k in range(n_folds):
+            holdout = fold_ids == k
+            src = train_src.iloc[~holdout]
+            g = src.groupby("geohash")["demand"]
+            m = g.mean()
+            med = g.median()
+            std = g.std()
+            mx = g.max()
+            ghs = train_src.iloc[holdout]["geohash"]
+            geo_mean[holdout] = ghs.map(m).fillna(global_mean).to_numpy()
+            geo_median[holdout] = ghs.map(med).fillna(global_mean).to_numpy()
+            geo_std[holdout] = ghs.map(std).fillna(0.0).to_numpy()
+            geo_max[holdout] = ghs.map(mx).fillna(global_mean).to_numpy()
+        train_df["geo_mean"] = geo_mean
+        train_df["geo_median"] = geo_median
+        train_df["geo_std"] = geo_std
+        train_df["geo_max"] = geo_max
+    else:
+        # train_df is a separate frame (e.g., validation); use full aggregates
+        train_df["geo_mean"] = train_df["geohash"].map(g_full.mean()).fillna(global_mean)
+        train_df["geo_median"] = train_df["geohash"].map(g_full.median()).fillna(global_mean)
+        train_df["geo_std"] = train_df["geohash"].map(g_full.std()).fillna(0.0)
+        train_df["geo_max"] = train_df["geohash"].map(g_full.max()).fillna(global_mean)
+
+
+def add_day48_stats_oof(train_src: pd.DataFrame, train_df: pd.DataFrame, test_df: pd.DataFrame, n_folds: int = 5) -> None:
+    """K-fold OOF for day-48 per-geohash aggregates on training rows."""
+    src48 = train_src[train_src["day"] == 48]
+    rng = np.random.default_rng(1)
+    fold_ids = rng.integers(0, n_folds, size=len(src48))
+
+    g_full = src48.groupby("geohash")["demand"]
+    glb = src48["demand"].mean()
+
+    # Test: full aggregates
+    for col, agg in [("d48_mean", "mean"), ("d48_median", "median"), ("d48_max", "max"), ("d48_std", "std")]:
+        vals = getattr(g_full, agg)()
+        test_df[col] = test_df["geohash"].map(vals).fillna(glb if col != "d48_std" else 0.0)
+    test_df["d48_p90"] = test_df["geohash"].map(g_full.quantile(0.9)).fillna(glb)
+
+    same_rows = (len(train_df) == len(train_src))
+    if same_rows:
+        # For day-48 training rows: OOF.  For day-49 rows: full aggregates (no leak).
+        is_d48 = train_src["day"].to_numpy() == 48
+        d48_mean_arr = np.full(len(train_src), np.nan)
+        d48_med_arr = np.full(len(train_src), np.nan)
+        d48_max_arr = np.full(len(train_src), np.nan)
+        d48_std_arr = np.full(len(train_src), np.nan)
+        d48_p90_arr = np.full(len(train_src), np.nan)
+        # Fill day-49 rows from full aggregate
+        d49_mask = ~is_d48
+        if d49_mask.any():
+            ghs = train_src.loc[d49_mask, "geohash"]
+            d48_mean_arr[d49_mask] = ghs.map(g_full.mean()).fillna(glb).to_numpy()
+            d48_med_arr[d49_mask] = ghs.map(g_full.median()).fillna(glb).to_numpy()
+            d48_max_arr[d49_mask] = ghs.map(g_full.max()).fillna(glb).to_numpy()
+            d48_std_arr[d49_mask] = ghs.map(g_full.std()).fillna(0.0).to_numpy()
+            d48_p90_arr[d49_mask] = ghs.map(g_full.quantile(0.9)).fillna(glb).to_numpy()
+        # OOF for day-48 rows
+        src48_pos = np.where(is_d48)[0]
+        for k in range(n_folds):
+            holdout_local = fold_ids == k
+            src_fold = src48.iloc[~holdout_local]
+            g = src_fold.groupby("geohash")["demand"]
+            m = g.mean()
+            med = g.median()
+            mx = g.max()
+            std = g.std()
+            p90 = g.quantile(0.9)
+            global_pos_in_train = src48_pos[holdout_local]
+            ghs = train_src.iloc[global_pos_in_train]["geohash"]
+            d48_mean_arr[global_pos_in_train] = ghs.map(m).fillna(glb).to_numpy()
+            d48_med_arr[global_pos_in_train] = ghs.map(med).fillna(glb).to_numpy()
+            d48_max_arr[global_pos_in_train] = ghs.map(mx).fillna(glb).to_numpy()
+            d48_std_arr[global_pos_in_train] = ghs.map(std).fillna(0.0).to_numpy()
+            d48_p90_arr[global_pos_in_train] = ghs.map(p90).fillna(glb).to_numpy()
+        train_df["d48_mean"] = d48_mean_arr
+        train_df["d48_median"] = d48_med_arr
+        train_df["d48_max"] = d48_max_arr
+        train_df["d48_std"] = d48_std_arr
+        train_df["d48_p90"] = d48_p90_arr
+    else:
+        train_df["d48_mean"] = train_df["geohash"].map(g_full.mean()).fillna(glb)
+        train_df["d48_median"] = train_df["geohash"].map(g_full.median()).fillna(glb)
+        train_df["d48_max"] = train_df["geohash"].map(g_full.max()).fillna(glb)
+        train_df["d48_std"] = train_df["geohash"].map(g_full.std()).fillna(0.0)
+        train_df["d48_p90"] = train_df["geohash"].map(g_full.quantile(0.9)).fillna(glb)
+
+
 def add_geohash_aggregates(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
     """Add per-geohash demand aggregates computed from train_src (must not leak).
 
@@ -145,6 +264,114 @@ def add_geohash_aggregates(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> 
         df["geo_median"] = df["geohash"].map(geo_med).fillna(global_mean)
         df["geo_std"] = df["geohash"].map(geo_std).fillna(0.0)
         df["geo_max"] = df["geohash"].map(geo_max).fillna(global_mean)
+
+
+def add_geo_hour_smoothed(train_src: pd.DataFrame, dfs: list[pd.DataFrame], smoothing: float = 2.0) -> None:
+    """Per-(geohash, hour) Bayesian-smoothed mean. Hour has 24 levels (4 slots
+    each), so each cell has ~4 observations on day 48 — more stable than
+    per-slot encoding with 1 obs per cell.
+    """
+    src48 = train_src[train_src["day"] == 48]
+    prior = src48.groupby("geohash")["demand"].mean()
+    glb = src48["demand"].mean()
+    g = src48.groupby(["geohash", "hour"])["demand"].agg(["mean", "count"]).reset_index()
+    g = g.rename(columns={"mean": "raw"})
+    g["prior"] = g["geohash"].map(prior).fillna(glb)
+    g["smoothed"] = (g["count"] * g["raw"] + smoothing * g["prior"]) / (g["count"] + smoothing)
+    sm = g.set_index(["geohash", "hour"])["smoothed"]
+    for df in dfs:
+        key = pd.MultiIndex.from_arrays([df["geohash"], df["hour"]])
+        vals = sm.reindex(key).values.astype(float)
+        ghp = df["geohash"].map(prior).fillna(glb).to_numpy()
+        nan_mask = np.isnan(vals)
+        vals[nan_mask] = ghp[nan_mask]
+        # mask day-48 rows
+        if "day" in df.columns:
+            vals = np.where(df["day"].to_numpy() == 48, np.nan, vals)
+        df["geo_hour_smoothed"] = vals
+
+
+def add_geo_bucket_smoothed(train_src: pd.DataFrame, dfs: list[pd.DataFrame], bucket_col: str, smoothing: float = 3.0) -> None:
+    """Generic per-(geohash, <bucket>) Bayesian-smoothed mean. Masked NaN on
+    day-48 rows (otherwise leakage: each cell has few obs).
+    """
+    src48 = train_src[train_src["day"] == 48]
+    prior = src48.groupby("geohash")["demand"].mean()
+    glb = src48["demand"].mean()
+    g = src48.groupby(["geohash", bucket_col])["demand"].agg(["mean", "count"]).reset_index()
+    g = g.rename(columns={"mean": "raw"})
+    g["prior"] = g["geohash"].map(prior).fillna(glb)
+    g["smoothed"] = (g["count"] * g["raw"] + smoothing * g["prior"]) / (g["count"] + smoothing)
+    sm = g.set_index(["geohash", bucket_col])["smoothed"]
+    col = f"geo_{bucket_col}_smoothed"
+    for df in dfs:
+        key = pd.MultiIndex.from_arrays([df["geohash"], df[bucket_col]])
+        vals = sm.reindex(key).values.astype(float)
+        ghp = df["geohash"].map(prior).fillna(glb).to_numpy()
+        nan_mask = np.isnan(vals)
+        vals[nan_mask] = ghp[nan_mask]
+        if "day" in df.columns:
+            vals = np.where(df["day"].to_numpy() == 48, np.nan, vals)
+        df[col] = vals
+
+
+def add_prefix_slot_smoothed(train_src: pd.DataFrame, dfs: list[pd.DataFrame], prefix_len: int = 5, smoothing: float = 5.0) -> None:
+    """Per-(geohash-prefix, slot) Bayesian-smoothed mean. Prefix-5 = ~5km area,
+    so each (prefix, slot) has many more observations than the full 6-char.
+    """
+    src48 = train_src[train_src["day"] == 48].copy()
+    src48[f"gh{prefix_len}"] = src48["geohash"].str[:prefix_len]
+    # Prior: per-prefix mean across all slots
+    prior = src48.groupby(f"gh{prefix_len}")["demand"].mean()
+    glb = src48["demand"].mean()
+    g = src48.groupby([f"gh{prefix_len}", "slot"])["demand"].agg(["mean", "count"]).reset_index()
+    g = g.rename(columns={"mean": "raw"})
+    g["prior"] = g[f"gh{prefix_len}"].map(prior).fillna(glb)
+    g["smoothed"] = (g["count"] * g["raw"] + smoothing * g["prior"]) / (g["count"] + smoothing)
+    sm = g.set_index([f"gh{prefix_len}", "slot"])["smoothed"]
+    col = f"gh{prefix_len}_slot_smoothed"
+    for df in dfs:
+        df[f"gh{prefix_len}"] = df["geohash"].str[:prefix_len]
+        key = pd.MultiIndex.from_arrays([df[f"gh{prefix_len}"], df["slot"]])
+        vals = sm.reindex(key).values.astype(float)
+        gh_prior = df[f"gh{prefix_len}"].map(prior).fillna(glb).to_numpy()
+        nan_mask = np.isnan(vals)
+        vals[nan_mask] = gh_prior[nan_mask]
+        # Don't mask for day-48 rows here: the prefix aggregates many rows so own-row leakage is tiny
+        df[col] = vals
+
+
+def add_bayes_smoothed_geo_slot(train_src: pd.DataFrame, dfs: list[pd.DataFrame], smoothing: float = 1.0) -> None:
+    """Bayesian-smoothed per-(geohash, slot) target encoding using day-48 data.
+
+    smoothed = (count * group_mean + smoothing * prior) / (count + smoothing)
+    where prior = per-geohash day-48 mean. With smoothing=3 and count=1, the
+    encoded value blends 25% exact lag + 75% geohash mean — regularizing the
+    noisy per-cell signal toward a stable prior.
+    """
+    src48 = train_src[train_src["day"] == 48]
+    # Per-geohash prior (the smoothing target)
+    prior = src48.groupby("geohash")["demand"].mean()
+    glb = src48["demand"].mean()
+
+    g = src48.groupby(["geohash", "slot"])["demand"].agg(["mean", "count"]).reset_index()
+    g = g.rename(columns={"mean": "raw"})
+    # Map prior onto g
+    g["prior"] = g["geohash"].map(prior).fillna(glb)
+    g["smoothed"] = (g["count"] * g["raw"] + smoothing * g["prior"]) / (g["count"] + smoothing)
+
+    smoothed_map = g.set_index(["geohash", "slot"])["smoothed"]
+    for df in dfs:
+        key = pd.MultiIndex.from_arrays([df["geohash"], df["slot"]])
+        vals = smoothed_map.reindex(key).values.astype(float)
+        # Fallback: per-geohash prior when (G, slot) missing
+        gh_prior = df["geohash"].map(prior).fillna(glb).to_numpy()
+        nan_mask = np.isnan(vals)
+        vals[nan_mask] = gh_prior[nan_mask]
+        # Mask out for day-48 training rows (they'd see their own row's contribution)
+        if "day" in df.columns:
+            vals = np.where(df["day"].to_numpy() == 48, np.nan, vals)
+        df["geo_slot_smoothed"] = vals
 
 
 def add_geohash_slot_aggregates(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
@@ -342,7 +569,7 @@ def add_day49_recent(train_src: pd.DataFrame, dfs: list[pd.DataFrame]) -> None:
         df["d49_slot_gap"] = slots - last_slot
 
 
-def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_subset: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_subset: pd.DataFrame | None = None, drop_features: list[str] | None = None, oof: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Apply all feature engineering steps. Returns (train_df, test_df, feature_cols).
 
     `train_src_subset` is the source used for target-encoding / lag features; if
@@ -365,10 +592,17 @@ def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_su
         encode_categoricals(src)
     else:
         src = train
-    add_geohash_aggregates(src, [train, test])
+    if oof:
+        add_geohash_aggregates_oof(src, train, test)
+        add_day48_stats_oof(src, train, test)
+    else:
+        add_geohash_aggregates(src, [train, test])
+        add_day48_stats(src, [train, test])
     add_geohash_slot_aggregates(src, [train, test])
+    add_bayes_smoothed_geo_slot(src, [train, test])
+    add_prefix_slot_smoothed(src, [train, test], prefix_len=5, smoothing=10.0)
+    add_prefix_slot_smoothed(src, [train, test], prefix_len=4, smoothing=5.0)
     add_lag_features(src, [train, test])
-    add_day48_stats(src, [train, test])
     add_slot_global(src, [train, test])
     add_d49_d48_calibration(src, [train, test])
     add_day49_recent(src, [train, test])
@@ -398,6 +632,9 @@ def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_su
         "geo_std",
         "geo_max",
         "geo_slot_mean",
+        "geo_slot_smoothed",
+        "gh5_slot_smoothed",
+        "gh4_slot_smoothed",
         "lag_same_slot",
         "lag_d48_off-2",
         "lag_d48_off-1",
@@ -418,30 +655,93 @@ def build_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_src_su
         "lag_calibrated",
         "lag_calibrated_delta",
     ]
+    if drop_features:
+        feature_cols = [f for f in feature_cols if f not in drop_features]
     return train, test, feature_cols
 
 
 # ---------- model ----------
-def train_lgbm(X_tr, y_tr, X_val=None, y_val=None, params=None):
+def train_catboost(X_tr, y_tr, X_val=None, y_val=None, params=None, sample_weight=None):
+    from catboost import CatBoostRegressor
+
+    default_params = dict(
+        iterations=4000,
+        learning_rate=0.05,
+        depth=8,
+        l2_leaf_reg=3.0,
+        random_seed=42,
+        bootstrap_type="Bernoulli",
+        subsample=0.85,
+        rsm=0.85,
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        early_stopping_rounds=100,
+        verbose=400,
+        allow_writing_files=False,
+    )
+    if params:
+        default_params.update(params)
+    model = CatBoostRegressor(**default_params)
+    eval_set = (X_val, y_val) if X_val is not None else None
+    model.fit(X_tr, y_tr, eval_set=eval_set, sample_weight=sample_weight, use_best_model=eval_set is not None)
+    return model
+
+
+def train_xgb(X_tr, y_tr, X_val=None, y_val=None, params=None):
+    import xgboost as xgb
+
+    default_params = {
+        "objective": "reg:squarederror",
+        "tree_method": "hist",
+        "learning_rate": 0.05,
+        "max_depth": 8,
+        "min_child_weight": 5,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
+        "reg_lambda": 1.0,
+        "verbosity": 0,
+        "seed": 42,
+    }
+    if params:
+        default_params.update(params)
+
+    # Use DataFrame directly so NaN handling is preserved
+    dtr = xgb.DMatrix(X_tr, label=y_tr)
+    evals = [(dtr, "train")]
+    if X_val is not None:
+        dval = xgb.DMatrix(X_val, label=y_val)
+        evals.append((dval, "val"))
+    model = xgb.train(
+        default_params,
+        dtr,
+        num_boost_round=4000,
+        evals=evals,
+        early_stopping_rounds=100 if X_val is not None else None,
+        verbose_eval=400,
+    )
+    return model
+
+
+def train_lgbm(X_tr, y_tr, X_val=None, y_val=None, params=None, sample_weight=None):
     import lightgbm as lgb
 
     default_params = {
         "objective": "regression",
         "metric": "rmse",
-        "learning_rate": 0.05,
-        "num_leaves": 127,
-        "min_data_in_leaf": 30,
+        "learning_rate": 0.02,
+        "num_leaves": 63,
+        "min_data_in_leaf": 100,
         "feature_fraction": 0.85,
         "bagging_fraction": 0.85,
         "bagging_freq": 5,
-        "lambda_l2": 1.0,
+        "lambda_l2": 2.0,
         "verbosity": -1,
         "seed": 42,
     }
     if params:
         default_params.update(params)
 
-    dtrain = lgb.Dataset(X_tr, label=y_tr)
+    dtrain = lgb.Dataset(X_tr, label=y_tr, weight=sample_weight)
     valid_sets = [dtrain]
     valid_names = ["train"]
     if X_val is not None:
@@ -475,7 +775,18 @@ def main(args):
         parse = full["timestamp"].str.split(":", expand=True)
         full_slot = parse[0].astype(int) * 4 + parse[1].astype(int) // 15
 
-        if args.hard_val:
+        if args.slot_val:
+            # Hold out 5% of day-48 slots 9-55 rows. Same slot distribution as
+            # test, so this exposes slot-of-day prediction quality. Caveat:
+            # val rows are day-48 (no d49 uplift), so this is harder than test.
+            rng = np.random.default_rng(7)
+            cand = full.index[(full["day"] == 48) & full_slot.between(9, 55)].to_numpy()
+            cand = np.array(cand, copy=True)
+            rng.shuffle(cand)
+            keep = cand[: int(len(cand) * 0.05)]
+            val_mask = pd.Series(False, index=full.index)
+            val_mask.loc[keep] = True
+        elif args.hard_val:
             # Hold out day-49 slots 5-8: forces val rows to be the "latest" d49
             # slots, so d49_last_demand has slot-gap 1-4 (closer to test).
             val_mask = (full["day"] == 49) & (full_slot >= 5) & (full_slot <= 8)
@@ -491,7 +802,20 @@ def main(args):
         val = full.loc[val_mask].reset_index(drop=True)
         print(f"Train rows: {len(tr_only)}  Validation rows: {len(val)}  (hard_val={args.hard_val})")
 
-        tr_df, val_df, feats = build_features(tr_only, val, train_src_subset=tr_only)
+        drop = args.drop.split(",") if args.drop else None
+        tr_df, val_df, feats = build_features(tr_only, val, train_src_subset=tr_only, drop_features=drop, oof=args.oof)
+        if drop:
+            print(f"Dropped features: {drop}")
+            print(f"Remaining features: {len(feats)}")
+
+        if args.mask_d49_val:
+            # Simulate test-like staleness: pretend val rows had no recent d49.
+            # Test rows have d49_last_demand from slot<=8 and current slot 9-55,
+            # giving slot_gap up to 47. Force val rows into that regime.
+            val_df["d49_last_demand"] = np.nan
+            val_df["d49_slot_gap"] = 30.0  # representative test slot-gap
+            print("Masked d49 recency features on val rows (simulating test staleness)")
+
         X_tr = tr_df[feats]
         y_tr = tr_df["demand"]
         X_val = val_df[feats]
@@ -509,7 +833,16 @@ def main(args):
         else:
             y_tr_used = y_tr
 
-        model = train_lgbm(X_tr, y_tr_used, X_val, np.log1p(y_val) if args.log_target else y_val)
+        if args.d49_weight != 1.0:
+            day_fit = tr_df["day"].to_numpy() if not args.day49_only else np.full(len(X_tr), 49)
+            weights = np.where(day_fit == 49, args.d49_weight, 1.0)
+        else:
+            weights = None
+
+        model = train_lgbm(
+            X_tr, y_tr_used, X_val, np.log1p(y_val) if args.log_target else y_val,
+            sample_weight=weights,
+        )
         preds = model.predict(X_val, num_iteration=model.best_iteration)
         if args.log_target:
             preds = np.expm1(preds)
@@ -530,7 +863,7 @@ def main(args):
 
     # Full submission run: multi-seed LightGBM ensemble with day-49 hold-out
     # for per-seed early stopping. Predictions averaged on the original scale.
-    tr_df, te_df, feats = build_features(tr_raw, te_raw)
+    tr_df, te_df, feats = build_features(tr_raw, te_raw, oof=args.oof)
 
     # Validation slice: 20% of day-49 train rows (same distribution as test)
     rng_split = np.random.default_rng(42)
@@ -561,11 +894,21 @@ def main(args):
     seed_r2s = []
     seed_imps = []
 
+    n_total_members = n_seeds + (1 if args.xgb else 0) + args.cat_seeds
+    weight_lgb = 1.0 / n_total_members
+
+    # Weight day-49 rows higher so they steer the model toward test distribution
+    day_arr = tr_df["day"].to_numpy()
+    weights_full = np.where(day_arr == 49, args.d49_weight, 1.0)
+
     for s in range(n_seeds):
         seed = 42 + s * 7
-        print(f"\n=== Seed {s+1}/{n_seeds} (seed={seed}) ===")
+        print(f"\n=== LGBM Seed {s+1}/{n_seeds} (seed={seed}) ===")
         params = {"seed": seed, "feature_fraction_seed": seed, "bagging_seed": seed}
-        model = train_lgbm(X.iloc[fit_pos], y_fit_full.iloc[fit_pos], X_val, y_val_used, params=params)
+        model = train_lgbm(
+            X.iloc[fit_pos], y_fit_full.iloc[fit_pos], X_val, y_val_used,
+            params=params, sample_weight=weights_full[fit_pos],
+        )
 
         vp = model.predict(X_val, num_iteration=model.best_iteration)
         tp = model.predict(X_te, num_iteration=model.best_iteration)
@@ -574,13 +917,53 @@ def main(args):
             tp = np.expm1(tp)
         vp = np.clip(vp, 0, 1)
         tp = np.clip(tp, 0, 1)
-        val_preds += vp / n_seeds
-        test_preds += tp / n_seeds
+        val_preds += vp * weight_lgb
+        test_preds += tp * weight_lgb
 
         r2 = r2_score(y_val, vp)
         seed_r2s.append(r2)
         print(f"   seed {seed} val R^2 = {r2:.5f}")
         seed_imps.append(model.feature_importance("gain"))
+
+    if args.xgb:
+        print(f"\n=== XGBoost member ===")
+        xgb_model = train_xgb(X.iloc[fit_pos], y_fit_full.iloc[fit_pos], X_val, y_val_used)
+        import xgboost as xgb
+        dval = xgb.DMatrix(X_val)
+        dte = xgb.DMatrix(X_te)
+        vp = xgb_model.predict(dval, iteration_range=(0, xgb_model.best_iteration + 1))
+        tp = xgb_model.predict(dte, iteration_range=(0, xgb_model.best_iteration + 1))
+        if use_log:
+            vp = np.expm1(vp)
+            tp = np.expm1(tp)
+        vp = np.clip(vp, 0, 1)
+        tp = np.clip(tp, 0, 1)
+        val_preds += vp * weight_lgb
+        test_preds += tp * weight_lgb
+        r2 = r2_score(y_val, vp)
+        print(f"   xgb val R^2 = {r2:.5f}")
+        seed_r2s.append(r2)
+
+    for s in range(args.cat_seeds):
+        seed = 100 + s * 11
+        print(f"\n=== CatBoost seed {s+1}/{args.cat_seeds} (seed={seed}) ===")
+        cat_model = train_catboost(
+            X.iloc[fit_pos], y_fit_full.iloc[fit_pos], X_val, y_val_used,
+            params={"random_seed": seed},
+            sample_weight=weights_full[fit_pos],
+        )
+        vp = cat_model.predict(X_val)
+        tp = cat_model.predict(X_te)
+        if use_log:
+            vp = np.expm1(vp)
+            tp = np.expm1(tp)
+        vp = np.clip(vp, 0, 1)
+        tp = np.clip(tp, 0, 1)
+        val_preds += vp * weight_lgb
+        test_preds += tp * weight_lgb
+        r2 = r2_score(y_val, vp)
+        seed_r2s.append(r2)
+        print(f"   cat seed {seed} val R^2 = {r2:.5f}")
 
     ens_r2 = r2_score(y_val, val_preds)
     print(f"\n>>> Ensemble val R^2 = {ens_r2:.5f}   (mean per-seed = {np.mean(seed_r2s):.5f})")
@@ -607,5 +990,12 @@ if __name__ == "__main__":
     ap.add_argument("--log_target", action="store_true", help="Train on log1p(demand)")
     ap.add_argument("--no_log_target", action="store_true", help="Disable log target in submission mode")
     ap.add_argument("--seeds", type=int, default=5, help="Number of seeds for ensemble in submission mode")
+    ap.add_argument("--xgb", action="store_true", help="Add an XGBoost member to the ensemble")
+    ap.add_argument("--cat_seeds", type=int, default=0, help="Number of CatBoost members")
+    ap.add_argument("--drop", default="", help="Comma-separated features to drop")
+    ap.add_argument("--oof", action="store_true", help="Use K-fold OOF target encoding for geohash aggregates")
+    ap.add_argument("--d49_weight", type=float, default=1.0, help="Sample weight multiplier for day-49 rows")
+    ap.add_argument("--mask_d49_val", action="store_true", help="Diagnostic: mask d49 recency features on val rows to simulate test staleness")
+    ap.add_argument("--slot_val", action="store_true", help="Val = random 5% of day-48 slots 9-55 (matches test slot distribution)")
     ap.add_argument("--out", default="submission_v2.csv")
     main(ap.parse_args())

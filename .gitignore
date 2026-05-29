@@ -1,3 +1,5 @@
 .deps/
 .venv/
 __pycache__/
+outputs/*
+!outputs/submission_seq2seq_3seed_anti5_w0p40.csv
